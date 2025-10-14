@@ -1,204 +1,224 @@
+
+import argparse
 import sqlite3
-import requests
-import datetime
+import datetime as dt
 import numpy as np
 import pandas as pd
+
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import LabelEncoder
+from sklearn.pipeline import Pipeline
 
-# Constants
 DB_PATH = "ac_data.db"
-LAT = -20.5382
-LON = -47.4009
-OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
-TIMEZONE = "America/Sao_Paulo"
 
+FEATURE_CAT = ["weather", "season", "period_of_day"]
+FEATURE_NUM = ["humidity"]
+FEATURES = FEATURE_CAT + FEATURE_NUM
 
-def fetch_historical_data():
-    conn = sqlite3.connect(DB_PATH)
-    query = "SELECT temperature, humidity, weather, season, timestamp FROM temperature_entries"
-    df = pd.read_sql_query(query, conn)
-    conn.close()
+def log(msg: str):
+    print(msg, flush=True)
+
+def read_table(db_path: str) -> pd.DataFrame:
+    log("Fetching historical data from DB...")
+    conn = sqlite3.connect(db_path)
+    try:
+        df = pd.read_sql_query("SELECT * FROM temperature_entries", conn)
+    finally:
+        conn.close()
+    if df.empty:
+        log("No data in table 'temperature_entries'.")
+        return df
+    if 'timestamp' in df.columns:
+        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+    if 'user_id' not in df.columns:
+        df['user_id'] = None
+    log(f"Loaded {len(df)} historical entries")
     return df
 
+def ensure_period_and_season(df: pd.DataFrame) -> pd.DataFrame:
+    def infer_period(h):
+        if 0 <= h < 6: return 'night'
+        if 6 <= h < 12: return 'morning'
+        if 12 <= h < 18: return 'afternoon'
+        return 'evening'
+    def infer_season(m):
+        if m in (12,1,2): return 'summer'
+        if m in (3,4,5): return 'autumn'
+        if m in (6,7,8): return 'winter'
+        return 'spring'
+    if 'period_of_day' not in df.columns or df['period_of_day'].isna().any():
+        df['hour'] = df['timestamp'].dt.hour
+        df['period_of_day'] = df['hour'].apply(lambda h: infer_period(int(h) if pd.notna(h) else 12))
+    if 'season' not in df.columns or df['season'].isna().any():
+        df['month'] = df['timestamp'].dt.month
+        df['season'] = df['month'].apply(lambda m: infer_season(int(m) if pd.notna(m) else 1))
+    return df
 
-def preprocess_data(df):
-    # Extract hour from timestamp to determine period_of_day slice (0-23)
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df['hour'] = df['timestamp'].dt.hour
-
-    # Define period_of_day (6-hour slices)
-    def period_of_day(hour):
-        if 0 <= hour < 6:
-            return 'night'
-        elif 6 <= hour < 12:
-            return 'morning'
-        elif 12 <= hour < 18:
-            return 'afternoon'
-        else:
-            return 'evening'
-
-    df['period_of_day'] = df['hour'].apply(period_of_day)
-
-    # Encode categorical variables
-    le_weather = LabelEncoder()
-    df['weather_enc'] = le_weather.fit_transform(df['weather'])
-
-    le_season = LabelEncoder()
-    df['season_enc'] = le_season.fit_transform(df['season'])
-
-    le_period = LabelEncoder()
-    df['period_enc'] = le_period.fit_transform(df['period_of_day'])
-
-    # Features
-    X = df[['humidity', 'weather_enc', 'season_enc', 'period_enc']]
-
-    # Target
-    y = df['temperature']
-
-    encoders = {
-        'weather': le_weather,
-        'season': le_season,
-        'period': le_period
-    }
-
-    return X, y, encoders
-
-
-def fetch_current_weather():
-    params = {
-        "latitude": LAT,
-        "longitude": LON,
-        "current_weather": True,
-        "timezone": TIMEZONE,
-        "hourly": "relative_humidity_2m,weathercode"
-    }
-
-    resp = requests.get(OPEN_METEO_URL, params=params)
-    data = resp.json()
-
-    current = data.get('current_weather', {})
-    humidity = None
-    weather_code = None
-
-    # Sometimes humidity is only in hourly data
-    if 'hourly' in data and 'relative_humidity_2m' in data['hourly']:
-        # get closest humidity to current hour
-        current_hour = current.get('time', '')[:13]  # "YYYY-MM-DDTHH"
-        times = data['hourly']['time']
-        humidity_list = data['hourly']['relative_humidity_2m']
-        humidity = None
-        for t, h in zip(times, humidity_list):
-            if t.startswith(current_hour):
+def fetch_current_weather() -> dict:
+    log("Fetching current weather data...")
+    import requests
+    LAT = -20.5382
+    LON = -47.4009
+    TIMEZONE = "America/Sao_Paulo"
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = dict(
+        latitude=LAT,
+        longitude=LON,
+        current="temperature_2m,relative_humidity_2m,weather_code",
+        timezone=TIMEZONE,
+        hourly="relative_humidity_2m,weather_code"
+    )
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    cur = data.get("current", {})
+    humidity = cur.get("relative_humidity_2m", None)
+    weather_code = cur.get("weather_code", None)
+    if humidity is None and "hourly" in data:
+        hours = data["hourly"].get("time", [])
+        hums = data["hourly"].get("relative_humidity_2m", [])
+        now_hour = dt.datetime.now().strftime("%Y-%m-%dT%H")
+        for t, h in zip(hours, hums):
+            if t.startswith(now_hour):
                 humidity = h
                 break
-
-    weather_code = current.get('weathercode', None)
-
-    # Map weather code to weather string (same map as Node.js)
-    weather_map = {
-        0: 'Clear',
-        1: 'Mainly Clear',
-        2: 'Partly Cloudy',
-        3: 'Overcast',
-        45: 'Fog',
-        48: 'Depositing Rime Fog',
-        51: 'Light Drizzle',
-        53: 'Moderate Drizzle',
-        55: 'Dense Drizzle',
-        61: 'Light Rain',
-        63: 'Moderate Rain',
-        65: 'Heavy Rain',
-        71: 'Light Snow',
-        73: 'Moderate Snow',
-        75: 'Heavy Snow',
-        80: 'Rain Showers',
-        81: 'Moderate Showers',
-        82: 'Violent Showers',
-        95: 'Thunderstorm',
-        96: 'Thunderstorm w/ Hail',
-        99: 'Thunderstorm w/ Heavy Hail'
+    code_map = {
+        0: 'Clear', 1: 'Mainly Clear', 2: 'Partly Cloudy', 3: 'Overcast',
+        45: 'Fog', 48: 'Depositing Rime Fog',
+        51: 'Light Drizzle', 53: 'Moderate Drizzle', 55: 'Dense Drizzle',
+        61: 'Light Rain', 63: 'Moderate Rain', 65: 'Heavy Rain',
+        71: 'Light Snow', 73: 'Moderate Snow', 75: 'Heavy Snow',
+        80: 'Rain Showers', 81: 'Moderate Showers', 82: 'Violent Showers',
+        95: 'Thunderstorm', 96: 'Thunderstorm w/ Hail', 99: 'Thunderstorm w/ Heavy Hail'
     }
+    weather = code_map.get(weather_code, 'Unknown')
+    if humidity is None:
+        humidity = 50
+    weather_dict = {"humidity": float(humidity), "weather": weather}
+    log(f"Current weather: {weather_dict}")
+    return weather_dict
 
-    weather = weather_map.get(weather_code, 'Unknown')
+def exponential_time_weight(ts: pd.Series, half_life_days: float = 60.0) -> np.ndarray:
+    now = pd.Timestamp.now(tz=ts.dt.tz) if hasattr(ts.dt, "tz") else pd.Timestamp.now()
+    days = (now - ts).dt.total_seconds() / 86400.0
+    days = days.fillna(days.median() if len(days) else 0.0)
+    lam = np.log(2.0) / half_life_days
+    w = np.exp(-lam * days.clip(lower=0))
+    return w.to_numpy()
 
-    return {
-        'humidity': humidity if humidity is not None else 50,  # fallback
-        'weather': weather
-    }
+def build_pipeline():
+    pre = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore"), FEATURE_CAT),
+            ("num", "passthrough", FEATURE_NUM),
+        ],
+        remainder="drop"
+    )
+    rf = RandomForestRegressor(
+        n_estimators=250,
+        random_state=42,
+        min_samples_leaf=2,
+        n_jobs=-1
+    )
+    pipe = Pipeline([("pre", pre), ("rf", rf)])
+    return pipe
 
-
-def get_season(month):
-    # Approximate seasons for southern hemisphere
-    if month in [12, 1, 2]:
-        return 'summer'
-    elif month in [3, 4, 5]:
-        return 'autumn'
-    elif month in [6, 7, 8]:
-        return 'winter'
+def train(pipe: Pipeline, X: pd.DataFrame, y: pd.Series, sample_weight=None) -> Pipeline:
+    log("Training model...")
+    # Ensure X has the exact columns in the same order to avoid sklearn warnings
+    X = X[FEATURES].copy()
+    if sample_weight is not None:
+        pipe.fit(X, y, **{"rf__sample_weight": sample_weight})
     else:
-        return 'spring'
+        pipe.fit(X, y)
+    return pipe
 
+def predict_with_interval(pipe: Pipeline, x_one: pd.DataFrame, q_low=0.1, q_high=0.9):
+    # x_one must be a DataFrame with the same columns as training
+    x_one = x_one[FEATURES].copy()
+    rf = pipe.named_steps["rf"]
+    Xt = pipe.named_steps["pre"].transform(x_one)
+    preds = np.vstack([est.predict(Xt) for est in rf.estimators_])
+    point = preds.mean(axis=0)[0]
+    low = np.percentile(preds, q_low * 100, axis=0)[0]
+    high = np.percentile(preds, q_high * 100, axis=0)[0]
+    return float(point), float(low), float(high)
 
-def get_period_of_day(hour):
-    if 0 <= hour < 6:
-        return 'night'
-    elif 6 <= hour < 12:
-        return 'morning'
-    elif 12 <= hour < 18:
-        return 'afternoon'
-    else:
-        return 'evening'
-
-
-def train_model(X, y):
-    model = RandomForestRegressor(n_estimators=100, random_state=42)
-    model.fit(X, y)
-    return model
-
-
-def predict_preferred_temperature(model, encoders, weather_data):
-    now = datetime.datetime.now()
-
-    season = get_season(now.month)
-    period = get_period_of_day(now.hour)
-
-    # Encode categorical values using encoders
-    weather_enc = encoders['weather'].transform([weather_data['weather']])[0] \
-        if weather_data['weather'] in encoders['weather'].classes_ else 0
-    season_enc = encoders['season'].transform([season])[0] \
-        if season in encoders['season'].classes_ else 0
-    period_enc = encoders['period'].transform([period])[0] \
-        if period in encoders['period'].classes_ else 0
-
-    X_pred = np.array([[weather_data['humidity'], weather_enc, season_enc, period_enc]])
-    pred_temp = model.predict(X_pred)[0]
-
-    return pred_temp
-
+def blend_user_global(user_pred, global_pred, n_user):
+    if user_pred is None or n_user <= 0:
+        return global_pred
+    alpha = min(0.8, n_user / 100.0)  # confidence grows with number of user samples
+    return alpha * user_pred + (1 - alpha) * global_pred
 
 def main():
-    print("Fetching historical data from DB...")
-    df = fetch_historical_data()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--db", default=DB_PATH, help="Path to SQLite DB (default: ac_data.db)")
+    ap.add_argument("--user-id", default=None, help="Personalize for this user if there is history (user_id column)")
+    ap.add_argument("--print-interval", action="store_true", help="Print 80% interval from the ensemble")
+    ap.add_argument("--debug", action="store_true", help="Print internal global/user predictions and sample counts")
+    args = ap.parse_args()
 
+    df = read_table(args.db)
     if df.empty:
-        print("No historical data found. Collect data first.")
+        return
+    df = ensure_period_and_season(df)
+
+    needed = {"temperature", "humidity", "weather", "season", "period_of_day", "timestamp"}
+    missing = needed - set(df.columns)
+    if missing:
+        log(f"Missing columns: {missing}")
         return
 
-    print(f"Loaded {len(df)} historical entries")
+    X_all = df[FEATURES].copy()
+    y_all = df["temperature"].astype(float)
+    w_all = exponential_time_weight(df["timestamp"])
 
-    X, y, encoders = preprocess_data(df)
-    print("Training model...")
-    model = train_model(X, y)
+    pipe_global = build_pipeline()
+    pipe_global = train(pipe_global, X_all, y_all, sample_weight=w_all)
 
-    print("Fetching current weather data...")
-    weather_data = fetch_current_weather()
+    weather_now = fetch_current_weather()
+    now = dt.datetime.now()
+    season = ("summer" if now.month in (12,1,2) else
+              "autumn" if now.month in (3,4,5) else
+              "winter" if now.month in (6,7,8) else "spring")
+    period = ("night" if 0 <= now.hour < 6 else
+              "morning" if 6 <= now.hour < 12 else
+              "afternoon" if 12 <= now.hour < 18 else "evening")
 
-    print(f"Current weather: {weather_data}")
+    x_cur = pd.DataFrame([{
+        "weather": weather_now["weather"],
+        "season": season,
+        "period_of_day": period,
+        "humidity": weather_now["humidity"],
+    }], columns=FEATURES)  # enforce column order
 
-    preferred_temp = predict_preferred_temperature(model, encoders, weather_data)
-    print(f"Predicted preferred AC temperature: {preferred_temp:.1f} °C")
+    g_point, g_low, g_high = predict_with_interval(pipe_global, x_cur)
 
+    user_pred = None
+    n_user = 0
+    if args.user_id is not None and "user_id" in df.columns:
+        df_u = df[df["user_id"] == args.user_id]
+        n_user = len(df_u)
+        if n_user >= 12:
+            X_u = df_u[FEATURES].copy()
+            y_u = df_u["temperature"].astype(float)
+            w_u = exponential_time_weight(df_u["timestamp"])
+            pipe_user = build_pipeline()
+            pipe_user = train(pipe_user, X_u, y_u, sample_weight=w_u)
+            u_point, _, _ = predict_with_interval(pipe_user, x_cur)
+            bias = (y_u.mean() - y_all.mean())
+            user_pred = float(u_point + bias)
 
-if __name__ == "__main__":
+    final_pred = blend_user_global(user_pred, g_point, n_user)
+    setpoint = round(final_pred)  # AC usually takes integer setpoints
+
+    # Output
+    log(f"Predicted preferred AC temperature: {final_pred:.1f} °C (recommended setpoint: {int(setpoint)} °C)")
+    if args.print_interval:
+        log(f"Global model 80% interval: [{g_low:.1f}, {g_high:.1f}] °C")
+    if args.debug:
+        log(f"[DEBUG] Global={g_point:.3f}; User={user_pred if user_pred is not None else 'NA'}; n_user={n_user}; Season/Period={season}/{period}; Weather={weather_now['weather']} ({weather_now['humidity']}% RH)")
+
+if __name__ == '__main__':
     main()
