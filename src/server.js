@@ -1,5 +1,6 @@
 import express from 'express';
 import { TemperatureController } from './interface/controllers/TemperatureController.js';
+import './interface/arduino/serialListener.js'
 
 const app = express();
 const port = 3000;
