@@ -1,5 +1,6 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include "LedControl.h"
 
 // --- Configuração do sensor ---
 #define ONE_WIRE_BUS 4
@@ -14,6 +15,47 @@ const int botaoDiminuir = 3;
 int temperatura;
 int estadoAnteriorAumentar = HIGH;
 int estadoAnteriorDiminuir = HIGH;
+
+// --- Configuração do display 8x8 ---
+LedControl lc = LedControl(12, 11, 10, 1); // DIN, CLK, CS, 1 display
+
+// --- Digitos 3x5 para display 8x8 ---
+byte numbers[10][5] = {
+    {B111, B101, B101, B101, B111}, // 0
+    {B010, B110, B010, B010, B111}, // 1
+    {B111, B001, B111, B100, B111}, // 2
+    {B111, B001, B111, B001, B111}, // 3
+    {B101, B101, B111, B001, B001}, // 4
+    {B111, B100, B111, B001, B111}, // 5
+    {B111, B100, B111, B101, B111}, // 6
+    {B111, B001, B010, B010, B010}, // 7
+    {B111, B101, B111, B101, B111}, // 8
+    {B111, B101, B111, B001, B111}  // 9
+};
+
+// --- Função para mostrar temperatura no display ---
+void showTemperature(int temp)
+{
+
+  lc.clearDisplay(0);
+
+  int tens = temp / 10;
+  int units = temp % 10;
+
+  for (int row = 0; row < 5; row++)
+  {
+    byte line = 0;
+
+    // Dezena: shift para esquerda (4 bits)
+    if (tens > 0)
+      line |= (numbers[tens][row] << 4);
+
+    // Unidade
+    line |= numbers[units][row];
+
+    lc.setRow(0, row + 1, line); // centraliza verticalmente
+  }
+}
 
 // --- Função para enviar temperatura via Serial ---
 void sendTemperature(int temp)
@@ -32,32 +74,21 @@ void setup()
   pinMode(botaoAumentar, INPUT_PULLUP);
   pinMode(botaoDiminuir, INPUT_PULLUP);
 
-  // Verifica quantos sensores estão conectados
-  int count = sensors.getDeviceCount();
-  Serial.print("Sensores encontrados: ");
-  Serial.println(count);
+  // Inicializa display
+  lc.shutdown(0, false);
+  lc.setIntensity(0, 8);
+  lc.clearDisplay(0);
 
-  if (count == 0)
-  {
-    Serial.println("⚠️ Nenhum sensor detectado! Verifique o fio de dados e o resistor de 4.7kΩ.");
-  }
-
-  // Lê temperatura inicial do sensor
+  // Lê temperatura inicial
   sensors.requestTemperatures();
   float tempC = sensors.getTempCByIndex(0);
+  temperatura = (tempC == DEVICE_DISCONNECTED_C) ? 25 : tempC;
 
-  if (tempC == DEVICE_DISCONNECTED_C)
-  {
-    Serial.println("❌ Erro: sensor desconectado ou leitura inválida (-127°C).");
-    temperatura = 25; // valor padrão caso o sensor falhe
-  }
-  else
-  {
-    Serial.print("Temperatura inicial detectada: ");
-    Serial.print(tempC);
-    Serial.println(" °C");
-    temperatura = tempC;
-  }
+  Serial.print("Temperatura inicial: ");
+  Serial.println(temperatura);
+
+  // Mostra no display
+  showTemperature(temperatura);
 
   // Envia temperatura inicial para o Node.js
   sendTemperature(temperatura);
@@ -73,13 +104,15 @@ void loop()
   int estadoAtualAumentar = digitalRead(botaoAumentar);
   int estadoAtualDiminuir = digitalRead(botaoDiminuir);
 
+  bool mudou = false;
+
   // Detecta pressão do botão Aumentar
   if (estadoAnteriorAumentar == HIGH && estadoAtualAumentar == LOW)
   {
     temperatura++;
     Serial.print("Temperatura aumentada para: ");
     Serial.println(temperatura);
-    sendTemperature(temperatura);
+    mudou = true;
   }
 
   // Detecta pressão do botão Diminuir
@@ -88,12 +121,19 @@ void loop()
     temperatura--;
     Serial.print("Temperatura diminuída para: ");
     Serial.println(temperatura);
-    sendTemperature(temperatura);
+    mudou = true;
   }
 
   // Atualiza os estados anteriores
   estadoAnteriorAumentar = estadoAtualAumentar;
   estadoAnteriorDiminuir = estadoAtualDiminuir;
+
+  // Atualiza display e envia via Serial se mudou
+  if (mudou)
+  {
+    showTemperature(temperatura);
+    sendTemperature(temperatura);
+  }
 
   delay(50); // debounce simples
 }
