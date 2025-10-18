@@ -33,25 +33,52 @@ byte numbers[10][5] = {
     {B111, B101, B111, B001, B111}  // 9
 };
 
-// --- Função para mostrar temperatura no display ---
+// --- Sinal de menos 3x5 ---
+byte minusSign[5] = {
+    B000,
+    B000,
+    B111,
+    B000,
+    B000};
+
+// --- Função para mostrar temperatura no display (com suporte a negativos) ---
 void showTemperature(int temp)
 {
-
   lc.clearDisplay(0);
 
-  int tens = temp / 10;
-  int units = temp % 10;
+  bool isNegative = (temp < 0);
+  int absTemp = abs(temp); // trabalha com valor absoluto
+
+  int tens = absTemp / 10;
+  int units = absTemp % 10;
 
   for (int row = 0; row < 5; row++)
   {
     byte line = 0;
 
-    // Dezena: shift para esquerda (4 bits)
-    if (tens > 0)
-      line |= (numbers[tens][row] << 4);
-
-    // Unidade
-    line |= numbers[units][row];
+    if (isNegative)
+    {
+      // Mostra sinal de menos à esquerda
+      line |= (minusSign[row] << 5);
+      // Unidade na direita (sem dezena para números -9 a -1)
+      if (tens > 0)
+      {
+        // Para -10 a -99: mostra apenas as dezenas (sem espaço para unidades)
+        line |= (numbers[tens][row] << 1);
+      }
+      else
+      {
+        // Para -1 a -9: mostra a unidade
+        line |= numbers[units][row];
+      }
+    }
+    else
+    {
+      // Número positivo (código original)
+      if (tens > 0)
+        line |= (numbers[tens][row] << 4);
+      line |= numbers[units][row];
+    }
 
     lc.setRow(0, row + 1, line); // centraliza verticalmente
   }
@@ -61,7 +88,7 @@ void showTemperature(int temp)
 void sendTemperature(int temp)
 {
   Serial.print("TEMP:");
-  Serial.println(temp); // prefixo TEMP: para o Node.js identificar
+  Serial.println(temp);
 }
 
 void setup()
@@ -94,8 +121,6 @@ void setup()
   sendTemperature(temperatura);
 
   Serial.println("Monitor iniciado. Use os botões para ajustar a temperatura.");
-  Serial.print("Temperatura inicial: ");
-  Serial.println(temperatura);
 }
 
 void loop()
