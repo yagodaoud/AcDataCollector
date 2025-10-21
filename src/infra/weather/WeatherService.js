@@ -36,7 +36,7 @@
 //   }
 // }
 
-import axios from 'axios';
+import axios from "axios";
 
 export class WeatherService {
   constructor() {
@@ -46,59 +46,60 @@ export class WeatherService {
 
   async getWeather() {
     try {
-      const url = 'https://api.open-meteo.com/v1/forecast';
+      const url = "https://api.open-meteo.com/v1/forecast";
 
       const response = await axios.get(url, {
         params: {
           latitude: this.lat,
           longitude: this.lon,
-          current: 'temperature_2m,relative_humidity_2m,weather_code',
-          timezone: 'America/Sao_Paulo'
-        }
+          current: "temperature_2m,relative_humidity_2m,weather_code",
+          timezone: "America/Sao_Paulo",
+        },
       });
 
       const data = response.data.current;
 
       return {
+        temperature: data.temperature_2m,
         weather: this.mapWeatherCode(data.weather_code),
-        humidity: data.relative_humidity_2m
+        humidity: data.relative_humidity_2m,
       };
     } catch (error) {
-      console.error('Failed to fetch weather data:', error.message);
+      console.error("Failed to fetch weather data:", error.message);
 
       // Fallback dummy data
       return {
-        weather: 'Unknown',
-        humidity: 0
+        weather: "Unknown",
+        humidity: 0,
       };
     }
   }
 
   mapWeatherCode(code) {
     const map = {
-      0: 'Clear',
-      1: 'Mainly Clear',
-      2: 'Partly Cloudy',
-      3: 'Overcast',
-      45: 'Fog',
-      48: 'Depositing Rime Fog',
-      51: 'Light Drizzle',
-      53: 'Moderate Drizzle',
-      55: 'Dense Drizzle',
-      61: 'Light Rain',
-      63: 'Moderate Rain',
-      65: 'Heavy Rain',
-      71: 'Light Snow',
-      73: 'Moderate Snow',
-      75: 'Heavy Snow',
-      80: 'Rain Showers',
-      81: 'Moderate Showers',
-      82: 'Violent Showers',
-      95: 'Thunderstorm',
-      96: 'Thunderstorm w/ Hail',
-      99: 'Thunderstorm w/ Heavy Hail'
+      0: "Clear",
+      1: "Mainly Clear",
+      2: "Partly Cloudy",
+      3: "Overcast",
+      45: "Fog",
+      48: "Depositing Rime Fog",
+      51: "Light Drizzle",
+      53: "Moderate Drizzle",
+      55: "Dense Drizzle",
+      61: "Light Rain",
+      63: "Moderate Rain",
+      65: "Heavy Rain",
+      71: "Light Snow",
+      73: "Moderate Snow",
+      75: "Heavy Snow",
+      80: "Rain Showers",
+      81: "Moderate Showers",
+      82: "Violent Showers",
+      95: "Thunderstorm",
+      96: "Thunderstorm w/ Hail",
+      99: "Thunderstorm w/ Heavy Hail",
     };
 
-    return map[code] || 'Unknown';
+    return map[code] || "Unknown";
   }
 }

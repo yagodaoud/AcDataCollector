@@ -1,9 +1,9 @@
-import sqlite3 from 'sqlite3';
+import sqlite3 from "sqlite3";
 
 export class Database {
   constructor() {
     // Open in-memory DB
-    this.db = new sqlite3.Database('ac_data.db');
+    this.db = new sqlite3.Database("ac_data.db");
 
     // Create the table
     this.db.serialize(() => {
@@ -11,6 +11,7 @@ export class Database {
         CREATE TABLE IF NOT EXISTS temperature_entries (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           temperature INTEGER,
+          weather_temperature INTEGER,
           timestamp TEXT,
           period_of_day TEXT,
           season TEXT,
@@ -26,26 +27,28 @@ export class Database {
       const query = `
         INSERT INTO temperature_entries (
           temperature,
+          weather_temperature,
           timestamp,
           period_of_day,
           season,
           weather,
           humidity
-        ) VALUES (?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
       `;
 
       const values = [
         entry.temperature,
+        entry.weather_temperature,
         entry.timestamp.toISOString(),
         entry.periodOfDay,
         entry.season,
         entry.weather,
-        entry.humidity
+        entry.humidity,
       ];
 
       this.db.run(query, values, function (err) {
         if (err) {
-          console.error('Failed to insert temperature entry:', err.message);
+          console.error("Failed to insert temperature entry:", err.message);
           reject(err);
         } else {
           resolve();
