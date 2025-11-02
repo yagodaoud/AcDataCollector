@@ -1,4 +1,3 @@
-
 import argparse
 import sqlite3
 import datetime as dt
@@ -9,11 +8,12 @@ from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
 
 DB_PATH = "ac_data.db"
 
 FEATURE_CAT = ["weather", "season", "period_of_day"]
-FEATURE_NUM = ["humidity"]
+FEATURE_NUM = ["humidity", "weather_temperature"]
 FEATURES = FEATURE_CAT + FEATURE_NUM
 
 def log(msg: str):
@@ -33,6 +33,9 @@ def read_table(db_path: str) -> pd.DataFrame:
         df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
     if 'user_id' not in df.columns:
         df['user_id'] = None
+    # Garante coluna nova
+    if 'weather_temperature' not in df.columns:
+        df['weather_temperature'] = np.nan
     log(f"Loaded {len(df)} historical entries")
     return df
 
@@ -64,25 +67,32 @@ def fetch_current_weather() -> dict:
     url = "https://api.open-meteo.com/v1/forecast"
     params = dict(
         latitude=LAT,
-        longitude=LON,
+        longitude=LAT and LON,  # dummy to keep linter happy if needed
         current="temperature_2m,relative_humidity_2m,weather_code",
         timezone=TIMEZONE,
-        hourly="relative_humidity_2m,weather_code"
+        hourly="relative_humidity_2m,weather_code,temperature_2m"
     )
+    # Corrige params
+    params["longitude"] = LON
     r = requests.get(url, params=params, timeout=15)
     r.raise_for_status()
     data = r.json()
     cur = data.get("current", {})
-    humidity = cur.get("relative_humidity_2m", None)
-    weather_code = cur.get("weather_code", None)
-    if humidity is None and "hourly" in data:
+    humidity = cur.get("relative_humidity_2m")
+    weather_code = cur.get("weather_code")
+    outside_temp = cur.get("temperature_2m")
+
+    if (humidity is None or outside_temp is None) and "hourly" in data:
         hours = data["hourly"].get("time", [])
         hums = data["hourly"].get("relative_humidity_2m", [])
+        temps = data["hourly"].get("temperature_2m", [])
         now_hour = dt.datetime.now().strftime("%Y-%m-%dT%H")
-        for t, h in zip(hours, hums):
-            if t.startswith(now_hour):
-                humidity = h
+        for t, h, tmp in zip(hours, hums, temps):
+            if isinstance(t, str) and t.startswith(now_hour):
+                if humidity is None: humidity = h
+                if outside_temp is None: outside_temp = tmp
                 break
+
     code_map = {
         0: 'Clear', 1: 'Mainly Clear', 2: 'Partly Cloudy', 3: 'Overcast',
         45: 'Fog', 48: 'Depositing Rime Fog',
@@ -93,9 +103,9 @@ def fetch_current_weather() -> dict:
         95: 'Thunderstorm', 96: 'Thunderstorm w/ Hail', 99: 'Thunderstorm w/ Heavy Hail'
     }
     weather = code_map.get(weather_code, 'Unknown')
-    if humidity is None:
-        humidity = 50
-    weather_dict = {"humidity": float(humidity), "weather": weather}
+    if humidity is None: humidity = 50
+    if outside_temp is None: outside_temp = 24.0
+    weather_dict = {"humidity": float(humidity), "weather": weather, "weather_temperature": float(outside_temp)}
     log(f"Current weather: {weather_dict}")
     return weather_dict
 
@@ -111,12 +121,12 @@ def build_pipeline():
     pre = ColumnTransformer(
         transformers=[
             ("cat", OneHotEncoder(handle_unknown="ignore"), FEATURE_CAT),
-            ("num", "passthrough", FEATURE_NUM),
+            ("num", SimpleImputer(strategy="median"), FEATURE_NUM),
         ],
         remainder="drop"
     )
     rf = RandomForestRegressor(
-        n_estimators=250,
+        n_estimators=300,
         random_state=42,
         min_samples_leaf=2,
         n_jobs=-1
@@ -126,7 +136,6 @@ def build_pipeline():
 
 def train(pipe: Pipeline, X: pd.DataFrame, y: pd.Series, sample_weight=None) -> Pipeline:
     log("Training model...")
-    # Ensure X has the exact columns in the same order to avoid sklearn warnings
     X = X[FEATURES].copy()
     if sample_weight is not None:
         pipe.fit(X, y, **{"rf__sample_weight": sample_weight})
@@ -135,7 +144,6 @@ def train(pipe: Pipeline, X: pd.DataFrame, y: pd.Series, sample_weight=None) -> 
     return pipe
 
 def predict_with_interval(pipe: Pipeline, x_one: pd.DataFrame, q_low=0.1, q_high=0.9):
-    # x_one must be a DataFrame with the same columns as training
     x_one = x_one[FEATURES].copy()
     rf = pipe.named_steps["rf"]
     Xt = pipe.named_steps["pre"].transform(x_one)
@@ -148,7 +156,7 @@ def predict_with_interval(pipe: Pipeline, x_one: pd.DataFrame, q_low=0.1, q_high
 def blend_user_global(user_pred, global_pred, n_user):
     if user_pred is None or n_user <= 0:
         return global_pred
-    alpha = min(0.8, n_user / 100.0)  # confidence grows with number of user samples
+    alpha = min(0.8, n_user / 100.0)
     return alpha * user_pred + (1 - alpha) * global_pred
 
 def main():
@@ -164,11 +172,17 @@ def main():
         return
     df = ensure_period_and_season(df)
 
-    needed = {"temperature", "humidity", "weather", "season", "period_of_day", "timestamp"}
+    needed = {"temperature", "humidity", "weather", "season", "period_of_day", "timestamp", "weather_temperature"}
     missing = needed - set(df.columns)
     if missing:
-        log(f"Missing columns: {missing}")
-        return
+        log(f"Warning: missing columns found {missing} — will impute when possible.")
+
+    # Imputação p/ linhas antigas
+    if df["weather_temperature"].isna().any():
+        df["weather_temperature"] = df.groupby(["season", "weather"])["weather_temperature"].transform(
+            lambda s: s.fillna(s.median())
+        )
+        df["weather_temperature"] = df["weather_temperature"].fillna(df["weather_temperature"].median())
 
     X_all = df[FEATURES].copy()
     y_all = df["temperature"].astype(float)
@@ -191,7 +205,8 @@ def main():
         "season": season,
         "period_of_day": period,
         "humidity": weather_now["humidity"],
-    }], columns=FEATURES)  # enforce column order
+        "weather_temperature": weather_now["weather_temperature"]
+    }], columns=FEATURES)
 
     g_point, g_low, g_high = predict_with_interval(pipe_global, x_cur)
 
@@ -211,14 +226,15 @@ def main():
             user_pred = float(u_point + bias)
 
     final_pred = blend_user_global(user_pred, g_point, n_user)
-    setpoint = round(final_pred)  # AC usually takes integer setpoints
+    setpoint = round(final_pred)
 
-    # Output
     log(f"Predicted preferred AC temperature: {final_pred:.1f} °C (recommended setpoint: {int(setpoint)} °C)")
     if args.print_interval:
         log(f"Global model 80% interval: [{g_low:.1f}, {g_high:.1f}] °C")
     if args.debug:
-        log(f"[DEBUG] Global={g_point:.3f}; User={user_pred if user_pred is not None else 'NA'}; n_user={n_user}; Season/Period={season}/{period}; Weather={weather_now['weather']} ({weather_now['humidity']}% RH)")
+        log(f"[DEBUG] Global={g_point:.3f}; User={user_pred if user_pred is not None else 'NA'}; n_user={n_user}; "
+            f"Season/Period={season}/{period}; Weather={weather_now['weather']} "
+            f"({weather_now['humidity']}% RH); Outside={weather_now['weather_temperature']:.1f} °C")
 
 if __name__ == '__main__':
     main()
